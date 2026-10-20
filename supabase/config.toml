@@ -1,0 +1,2 @@
+[functions.run-code]
+verify_jwt = true
