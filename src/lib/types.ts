@@ -54,3 +54,24 @@ export interface RunResult {
   error?: string;
   details?: string;
 }
+
+export interface CursorPosition {
+  lineNumber: number;
+  column: number;
+}
+
+export interface Peer {
+  userId: string;
+  displayName: string;
+  color: string;
+  cursor?: CursorPosition;
+  micOn?: boolean;
+  lastSeen: number;
+}
+
+export interface VoiceSignal {
+  from: string;
+  to: string;
+  type: 'offer' | 'answer' | 'ice';
+  data: unknown;
+}
