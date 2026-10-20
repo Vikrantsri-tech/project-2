@@ -1,6 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import type { RealtimeChannel } from '@supabase/supabase-js';
-import SimplePeer from 'simple-peer';
 import { supabase } from '@/lib/supabase';
 import type { Peer } from '@/lib/types';
 
@@ -19,6 +18,18 @@ interface UseVoiceChatReturn {
   permissionError: string | null;
 }
 
+interface VoiceSignalPayload {
+  from: string;
+  to: string;
+  type: 'offer' | 'answer' | 'ice';
+  data: unknown;
+}
+
+const ICE_SERVERS: RTCIceServer[] = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun1.l.google.com:19302' },
+];
+
 export function useVoiceChat({ roomId, userId, displayName, peers }: UseVoiceChatOptions): UseVoiceChatReturn {
   const [micOn, setMicOn] = useState(false);
   const [speakingPeers, setSpeakingPeers] = useState<Set<string>>(new Set());
@@ -26,15 +37,13 @@ export function useVoiceChat({ roomId, userId, displayName, peers }: UseVoiceCha
 
   const streamRef = useRef<MediaStream | null>(null);
   const channelRef = useRef<RealtimeChannel | null>(null);
-  const peerConnsRef = useRef<Map<string, InstanceType<typeof SimplePeer>>>(new Map());
+  const peerConnsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
   const audioElementsRef = useRef<Map<string, HTMLAudioElement>>(new Map());
-  const displayNameRef = useRef(displayName);
   const userIdRef = useRef(userId);
 
   useEffect(() => {
-    displayNameRef.current = displayName;
     userIdRef.current = userId;
-  }, [displayName, userId]);
+  }, [userId]);
 
   const ensureStream = useCallback(async (): Promise<MediaStream | null> => {
     if (streamRef.current) return streamRef.current;
@@ -52,10 +61,12 @@ export function useVoiceChat({ roomId, userId, displayName, peers }: UseVoiceCha
   }, []);
 
   const sendSignal = useCallback((to: string, type: 'offer' | 'answer' | 'ice', data: unknown) => {
+    const from = userIdRef.current;
+    if (!from) return;
     channelRef.current?.send({
       type: 'broadcast',
       event: 'voice-signal',
-      payload: { from: userIdRef.current, to, type, data },
+      payload: { from, to, type, data } satisfies VoiceSignalPayload,
     });
   }, []);
 
@@ -69,7 +80,6 @@ export function useVoiceChat({ roomId, userId, displayName, peers }: UseVoiceCha
     audio.srcObject = stream;
     audio.play().catch(() => {});
 
-    // Simple voice activity detection via volume analysis
     try {
       const ctx = new AudioContext();
       const src = ctx.createMediaStreamSource(stream);
@@ -103,65 +113,80 @@ export function useVoiceChat({ roomId, userId, displayName, peers }: UseVoiceCha
     }
   }, []);
 
-  const createPeer = useCallback((peerId: string, initiator: boolean, stream: MediaStream) => {
-    if (peerConnsRef.current.has(peerId)) return;
-    const peer = new SimplePeer({
-      initiator,
-      stream,
-      config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }, { urls: 'stun:stun1.l.google.com:19302' }] },
-    });
-
-    peer.on('signal', (data) => {
-      const dataType = (data as { type?: string }).type;
-      const type: 'offer' | 'answer' | 'ice' =
-        dataType === 'offer' ? 'offer' : dataType === 'answer' ? 'answer' : 'ice';
-      sendSignal(peerId, type, data);
-    });
-
-    peer.on('stream', (remoteStream) => {
-      attachRemoteStream(peerId, remoteStream);
-    });
-
-    peer.on('error', () => {
-      peer.destroy();
+  const closePeer = useCallback((peerId: string) => {
+    const conn = peerConnsRef.current.get(peerId);
+    if (conn) {
+      conn.close();
       peerConnsRef.current.delete(peerId);
+    }
+    const audio = audioElementsRef.current.get(peerId);
+    if (audio) {
+      audio.srcObject = null;
+      audioElementsRef.current.delete(peerId);
+    }
+    setSpeakingPeers((prev) => {
+      const next = new Set(prev);
+      next.delete(peerId);
+      return next;
     });
+  }, []);
 
-    peer.on('close', () => {
-      peerConnsRef.current.delete(peerId);
-      const audio = audioElementsRef.current.get(peerId);
-      if (audio) {
-        audio.srcObject = null;
-        audioElementsRef.current.delete(peerId);
+  const createPeerConnection = useCallback(
+    (peerId: string, initiator: boolean, stream: MediaStream): RTCPeerConnection => {
+      const pc = new RTCPeerConnection({ iceServers: ICE_SERVERS });
+      peerConnsRef.current.set(peerId, pc);
+
+      stream.getTracks().forEach((track) => pc.addTrack(track, stream));
+
+      pc.onicecandidate = (e) => {
+        if (e.candidate) sendSignal(peerId, 'ice', e.candidate.toJSON());
+      };
+
+      pc.ontrack = (e) => {
+        if (e.streams[0]) attachRemoteStream(peerId, e.streams[0]);
+      };
+
+      pc.onconnectionstatechange = () => {
+        if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+          closePeer(peerId);
+        }
+      };
+
+      if (initiator) {
+        pc.onnegotiationneeded = async () => {
+          try {
+            const offer = await pc.createOffer();
+            await pc.setLocalDescription(offer);
+            sendSignal(peerId, 'offer', pc.localDescription);
+          } catch {
+            closePeer(peerId);
+          }
+        };
       }
-      setSpeakingPeers((prev) => {
-        const next = new Set(prev);
-        next.delete(peerId);
-        return next;
-      });
-    });
 
-    peerConnsRef.current.set(peerId, peer);
-  }, [sendSignal, attachRemoteStream]);
+      return pc;
+    },
+    [sendSignal, attachRemoteStream, closePeer]
+  );
 
   const connectToPeers = useCallback(async () => {
     const stream = await ensureStream();
     if (!stream) return;
-
+    const myId = userIdRef.current ?? '';
     peers.forEach((peer) => {
-      if (peer.userId === userIdRef.current) return;
-      // Lower userId is initiator to avoid both ends offering
-      const initiator = (userIdRef.current ?? '') < peer.userId;
-      createPeer(peer.userId, initiator, stream);
+      if (peer.userId === myId) return;
+      if (peerConnsRef.current.has(peer.userId)) return;
+      const initiator = myId < peer.userId;
+      createPeerConnection(peer.userId, initiator, stream);
     });
-  }, [ensureStream, peers, createPeer]);
+  }, [ensureStream, peers, createPeerConnection]);
 
   const toggleMic = useCallback(async () => {
     if (!micOn) {
       await connectToPeers();
       setMicOn(true);
     } else {
-      peerConnsRef.current.forEach((p) => p.destroy());
+      peerConnsRef.current.forEach((_, id) => closePeer(id));
       peerConnsRef.current.clear();
       audioElementsRef.current.forEach((a) => {
         a.srcObject = null;
@@ -174,21 +199,22 @@ export function useVoiceChat({ roomId, userId, displayName, peers }: UseVoiceCha
       }
       setMicOn(false);
     }
-  }, [micOn, connectToPeers]);
+  }, [micOn, connectToPeers, closePeer]);
 
-  // Handle new peers joining after we're already live
+  // Connect to newly-joined peers while mic is on
   useEffect(() => {
     if (!micOn) return;
     const stream = streamRef.current;
     if (!stream) return;
+    const myId = userIdRef.current ?? '';
     peers.forEach((peer) => {
-      if (peer.userId === userIdRef.current) return;
+      if (peer.userId === myId) return;
       if (!peerConnsRef.current.has(peer.userId)) {
-        const initiator = (userIdRef.current ?? '') < peer.userId;
-        createPeer(peer.userId, initiator, stream);
+        const initiator = myId < peer.userId;
+        createPeerConnection(peer.userId, initiator, stream);
       }
     });
-  }, [peers, micOn, createPeer]);
+  }, [peers, micOn, createPeerConnection]);
 
   // Signaling channel
   useEffect(() => {
@@ -198,45 +224,46 @@ export function useVoiceChat({ roomId, userId, displayName, peers }: UseVoiceCha
 
     channel
       .on('broadcast', { event: 'voice-signal' }, (raw: unknown) => {
-        const msg = raw as { payload?: { from?: string; to?: string; type?: string; data?: unknown } };
+        const msg = raw as { payload?: VoiceSignalPayload };
         const p = msg.payload;
-        if (!p || !p.from || !p.to || !userId || p.to !== userId || p.from === userId) return;
+        if (!p || !userId || p.to !== userId || p.from === userId) return;
         const fromId = p.from;
-        let peer = peerConnsRef.current.get(fromId);
-        if (!peer && p.type === 'offer') {
+
+        let pc = peerConnsRef.current.get(fromId);
+        if (!pc && p.type === 'offer') {
           const stream = streamRef.current;
           if (!stream) return;
-          peer = new SimplePeer({ initiator: false, stream, config: { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] } });
-          peer.on('signal', (data) => {
-            const dataType = (data as { type?: string }).type;
-            const type: 'answer' | 'ice' = dataType === 'answer' ? 'answer' : 'ice';
-            sendSignal(fromId, type, data);
-          });
-          peer.on('stream', (remoteStream) => attachRemoteStream(fromId, remoteStream));
-          peer.on('error', () => {
-            peer?.destroy();
-            peerConnsRef.current.delete(fromId);
-          });
-          peer.on('close', () => {
-            peerConnsRef.current.delete(fromId);
-            const audio = audioElementsRef.current.get(fromId);
-            if (audio) {
-              audio.srcObject = null;
-              audioElementsRef.current.delete(fromId);
+          pc = createPeerConnection(fromId, false, stream);
+        }
+        if (!pc) return;
+
+        (async () => {
+          try {
+            if (p.type === 'offer' || p.type === 'answer') {
+              await pc.setRemoteDescription(new RTCSessionDescription(p.data as RTCSessionDescriptionInit));
+              if (p.type === 'offer') {
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                sendSignal(fromId, 'answer', pc.localDescription);
+              }
+            } else if (p.type === 'ice') {
+              try {
+                await pc.addIceCandidate(p.data as RTCIceCandidateInit);
+              } catch {
+                // candidate may arrive before description; ignore
+              }
             }
-          });
-          peerConnsRef.current.set(fromId, peer);
-        }
-        if (peer) {
-          peer.signal(p.data as SimplePeer.SignalData);
-        }
+          } catch {
+            closePeer(fromId);
+          }
+        })();
       })
       .subscribe();
 
     return () => {
       channel.unsubscribe();
       channelRef.current = null;
-      peerConnsRef.current.forEach((p) => p.destroy());
+      peerConnsRef.current.forEach((_, id) => closePeer(id));
       peerConnsRef.current.clear();
       audioElementsRef.current.forEach((a) => {
         a.srcObject = null;
@@ -248,7 +275,7 @@ export function useVoiceChat({ roomId, userId, displayName, peers }: UseVoiceCha
       }
       setSpeakingPeers(new Set());
     };
-  }, [roomId, userId, sendSignal, attachRemoteStream]);
+  }, [roomId, userId, sendSignal, createPeerConnection, closePeer]);
 
   return {
     micOn,
